@@ -37,6 +37,9 @@ let currentItemsPage = 1; // 当前页码
 let itemsPerPage = 20; // 每页显示数量
 let totalItemsPages = 0; // 总页数
 let currentSearchKeyword = ''; // 当前搜索关键词
+let itemPublishPreviewUrls = [];
+let itemPublishInitialized = false;
+let itemPublishSubmitting = false;
 
 // 订单列表搜索和分页相关变量
 let allOrdersData = []; // 存储所有订单数据
@@ -102,6 +105,9 @@ function showSection(sectionName) {
         break;
     case 'accounts':         // 【账号管理菜单】
         loadCookies();
+        break;
+    case 'item-publish':    // 【商品发布菜单】
+        loadItemPublish();
         break;
     case 'items':           // 【商品管理菜单】
         loadItems();
@@ -9118,6 +9124,7 @@ function updatePresetSelection(selectedColor) {
 const DEFAULT_MENU_ITEMS = [
     { id: 'dashboard', name: '仪表盘', icon: 'bi-speedometer2', required: true },
     { id: 'accounts', name: '账号管理', icon: 'bi-person-circle', required: false },
+    { id: 'item-publish', name: '商品发布', icon: 'bi-bag-plus', required: false },
     { id: 'items', name: '商品管理', icon: 'bi-box-seam', required: false },
     { id: 'orders', name: '订单管理', icon: 'bi-receipt-cutoff', required: false },
     { id: 'auto-reply', name: '自动回复', icon: 'bi-chat-left-text', required: false },
@@ -9915,6 +9922,371 @@ async function doRestartSystem() {
     } catch (error) {
         console.error('重启系统失败:', error);
         showToast('重启系统失败，请检查网络连接', 'danger');
+    }
+}
+
+// ================================
+// 【商品发布菜单】相关功能
+// ================================
+
+async function loadItemPublish() {
+    ensureItemPublishPageInitialized();
+    handlePublishDeliveryChoiceChange();
+    await loadItemPublishAccounts();
+}
+
+function ensureItemPublishPageInitialized() {
+    if (itemPublishInitialized) {
+        return;
+    }
+
+    const form = document.getElementById('itemPublishForm');
+    if (form) {
+        form.addEventListener('reset', () => {
+            window.setTimeout(() => clearItemPublishForm(true), 0);
+        });
+    }
+
+    itemPublishInitialized = true;
+}
+
+async function loadItemPublishAccounts() {
+    const select = document.getElementById('publishCookieId');
+    if (!select) {
+        return;
+    }
+
+    const currentValue = select.value;
+
+    try {
+        const response = await fetch(`${apiBase}/cookies/details`, {
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        const accounts = await response.json();
+        const availableAccounts = accounts.filter(account => account.has_cookie_value !== false && account.enabled !== false);
+
+        select.innerHTML = '<option value="">请选择账号</option>';
+
+        if (availableAccounts.length === 0) {
+            const option = document.createElement('option');
+            option.value = '';
+            option.disabled = true;
+            option.textContent = '暂无可用账号';
+            select.appendChild(option);
+            return;
+        }
+
+        availableAccounts.forEach(account => {
+            const option = document.createElement('option');
+            option.value = account.id;
+            option.textContent = buildItemPublishAccountLabel(account);
+            select.appendChild(option);
+        });
+
+        if (currentValue && availableAccounts.some(account => account.id === currentValue)) {
+            select.value = currentValue;
+        } else if (availableAccounts.length === 1) {
+            select.value = availableAccounts[0].id;
+        }
+    } catch (error) {
+        console.error('加载发布账号失败:', error);
+        select.innerHTML = '<option value="">加载账号失败</option>';
+        showToast('加载发布账号失败', 'danger');
+    }
+}
+
+function buildItemPublishAccountLabel(account) {
+    const remark = String(account.remark || '').trim();
+    const username = String(account.username || '').trim();
+    if (remark) {
+        return `${account.id} · ${remark}`;
+    }
+    if (username) {
+        return `${account.id} · ${username}`;
+    }
+    return account.id;
+}
+
+function handlePublishDeliveryChoiceChange() {
+    const choice = document.getElementById('publishDeliveryChoice')?.value || '包邮';
+    const postPriceWrap = document.getElementById('publishPostPriceWrap');
+    const postPriceInput = document.getElementById('publishPostPrice');
+    const shouldShowPostPrice = choice === '一口价';
+
+    if (postPriceWrap) {
+        postPriceWrap.style.display = shouldShowPostPrice ? '' : 'none';
+    }
+    if (postPriceInput) {
+        postPriceInput.required = shouldShowPostPrice;
+        if (!shouldShowPostPrice) {
+            postPriceInput.value = '';
+        }
+    }
+}
+
+function handlePublishImagesChange() {
+    const input = document.getElementById('publishImages');
+    if (!input) {
+        return;
+    }
+
+    const files = Array.from(input.files || []);
+    if (files.length > 9) {
+        showToast('单次最多上传 9 张图片', 'warning');
+        input.value = '';
+        clearItemPublishImagePreviews();
+        return;
+    }
+
+    renderItemPublishImagePreviews(files);
+}
+
+function renderItemPublishImagePreviews(files) {
+    const previewContainer = document.getElementById('publishImagePreviewList');
+    const summary = document.getElementById('publishImageSummary');
+
+    clearItemPublishImagePreviews();
+
+    if (!previewContainer) {
+        return;
+    }
+
+    if (!files || files.length === 0) {
+        previewContainer.innerHTML = '<div class="item-publish-preview-empty">尚未选择图片</div>';
+        if (summary) {
+            summary.textContent = '请上传 1-9 张图片，建议首图清晰展示商品主体。';
+        }
+        return;
+    }
+
+    const totalSize = files.reduce((sum, file) => sum + (file.size || 0), 0);
+    previewContainer.innerHTML = files.map((file, index) => {
+        const objectUrl = URL.createObjectURL(file);
+        itemPublishPreviewUrls.push(objectUrl);
+        return `
+            <div class="item-publish-preview-card">
+                <img src="${objectUrl}" alt="预览图 ${index + 1}">
+                <div class="item-publish-preview-meta">
+                    <div class="item-publish-preview-name" title="${escapeHtml(file.name || `图片 ${index + 1}`)}">${escapeHtml(file.name || `图片 ${index + 1}`)}</div>
+                    <div class="item-publish-preview-size">${formatFileSize(file.size || 0)}</div>
+                </div>
+            </div>
+        `;
+    }).join('');
+
+    if (summary) {
+        summary.textContent = `已选择 ${files.length} 张图片，总大小 ${formatFileSize(totalSize)}。`;
+    }
+}
+
+function clearItemPublishImagePreviews() {
+    itemPublishPreviewUrls.forEach(url => URL.revokeObjectURL(url));
+    itemPublishPreviewUrls = [];
+
+    const previewContainer = document.getElementById('publishImagePreviewList');
+    const summary = document.getElementById('publishImageSummary');
+    if (previewContainer) {
+        previewContainer.innerHTML = '<div class="item-publish-preview-empty">尚未选择图片</div>';
+    }
+    if (summary) {
+        summary.textContent = '请上传 1-9 张图片，建议首图清晰展示商品主体。';
+    }
+}
+
+function clearItemPublishForm(clearResult = true) {
+    clearItemPublishImagePreviews();
+    handlePublishDeliveryChoiceChange();
+
+    const imagesInput = document.getElementById('publishImages');
+    if (imagesInput) {
+        imagesInput.value = '';
+    }
+
+    if (clearResult) {
+        hideItemPublishResult();
+    }
+}
+
+function hideItemPublishResult() {
+    const panel = document.getElementById('publishResultPanel');
+    const meta = document.getElementById('publishResultMeta');
+    if (panel) {
+        panel.style.display = 'none';
+    }
+    if (meta) {
+        meta.innerHTML = '';
+    }
+}
+
+function renderItemPublishResult(data, isSuccess) {
+    const panel = document.getElementById('publishResultPanel');
+    const badge = document.getElementById('publishResultBadge');
+    const title = document.getElementById('publishResultTitle');
+    const message = document.getElementById('publishResultMessage');
+    const meta = document.getElementById('publishResultMeta');
+
+    if (!panel || !badge || !title || !message || !meta) {
+        return;
+    }
+
+    panel.style.display = '';
+    badge.className = `badge ${isSuccess ? 'text-bg-success' : 'text-bg-danger'}`;
+    badge.textContent = isSuccess ? '成功' : '失败';
+    title.textContent = isSuccess ? '商品发布完成' : '商品发布失败';
+    message.textContent = data.message || (isSuccess ? '商品发布成功' : '商品发布失败');
+
+    const metaRows = [];
+    if (data.published_item_id) {
+        metaRows.push({ label: '商品ID', value: data.published_item_id });
+    }
+
+    const syncResult = data.sync_result || {};
+    if (syncResult.message) {
+        metaRows.push({ label: '同步结果', value: syncResult.message });
+    }
+
+    const pageSync = syncResult.page_sync || {};
+    if (pageSync.current_count || pageSync.saved_count) {
+        metaRows.push({
+            label: '最近页同步',
+            value: `获取 ${pageSync.current_count || 0} 个商品，写入 ${pageSync.saved_count || 0} 个`
+        });
+    }
+
+    const fullSync = syncResult.full_sync || {};
+    if (fullSync.used) {
+        metaRows.push({
+            label: '补充同步',
+            value: fullSync.success
+                ? `全量扫描 ${fullSync.total_count || 0} 个商品，写入 ${fullSync.total_saved || 0} 个`
+                : (fullSync.error || '补充同步失败')
+        });
+    }
+
+    if (!isSuccess && data.detail) {
+        metaRows.push({ label: '错误详情', value: data.detail });
+    }
+
+    if (metaRows.length === 0) {
+        meta.innerHTML = '<div class="text-muted small">当前没有更多结果详情。</div>';
+        return;
+    }
+
+    meta.innerHTML = metaRows.map(row => `
+        <div class="item-publish-result-row">
+            <span class="item-publish-result-label">${escapeHtml(row.label)}</span>
+            <span class="item-publish-result-value">${escapeHtml(String(row.value || ''))}</span>
+        </div>
+    `).join('');
+}
+
+async function submitItemPublishForm() {
+    if (itemPublishSubmitting) {
+        return;
+    }
+
+    const cookieId = document.getElementById('publishCookieId')?.value || '';
+    const title = document.getElementById('publishTitle')?.value.trim() || '';
+    const description = document.getElementById('publishDescription')?.value.trim() || '';
+    const currentPrice = document.getElementById('publishCurrentPrice')?.value.trim() || '';
+    const originalPrice = document.getElementById('publishOriginalPrice')?.value.trim() || '';
+    const deliveryChoice = document.getElementById('publishDeliveryChoice')?.value || '包邮';
+    const postPrice = document.getElementById('publishPostPrice')?.value.trim() || '';
+    const canSelfPickup = document.getElementById('publishCanSelfPickup')?.checked || false;
+    const imageInput = document.getElementById('publishImages');
+    const files = Array.from(imageInput?.files || []);
+    const submitButton = document.getElementById('itemPublishSubmitBtn');
+
+    if (!cookieId) {
+        showToast('请选择发布账号', 'warning');
+        return;
+    }
+    if (!title) {
+        showToast('请输入商品标题', 'warning');
+        return;
+    }
+    if (!description) {
+        showToast('请输入商品描述', 'warning');
+        return;
+    }
+    if (files.length === 0) {
+        showToast('请至少上传 1 张商品图片', 'warning');
+        return;
+    }
+    if (files.length > 9) {
+        showToast('单次最多上传 9 张图片', 'warning');
+        return;
+    }
+    if (originalPrice && !currentPrice) {
+        showToast('填写原价时必须同时填写现价', 'warning');
+        return;
+    }
+    if (deliveryChoice === '一口价' && !postPrice) {
+        showToast('运费方式为一口价时必须填写邮费', 'warning');
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append('cookie_id', cookieId);
+    formData.append('title', title);
+    formData.append('description', description);
+    formData.append('current_price', currentPrice);
+    formData.append('original_price', originalPrice);
+    formData.append('delivery_choice', deliveryChoice);
+    formData.append('post_price', postPrice);
+    formData.append('can_self_pickup', canSelfPickup ? 'true' : 'false');
+    files.forEach(file => formData.append('images', file));
+
+    itemPublishSubmitting = true;
+    if (submitButton) {
+        submitButton.disabled = true;
+        submitButton.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>发布中...';
+    }
+
+    try {
+        const response = await fetch(`${apiBase}/item-publish`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            },
+            body: formData
+        });
+
+        const responseText = await response.text();
+        let responseData = {};
+        try {
+            responseData = responseText ? JSON.parse(responseText) : {};
+        } catch (parseError) {
+            responseData = { detail: responseText || `HTTP ${response.status}` };
+        }
+
+        if (!response.ok) {
+            const errorMessage = responseData.detail || responseData.message || `HTTP ${response.status}`;
+            renderItemPublishResult({ message: errorMessage, detail: errorMessage }, false);
+            showToast(errorMessage, 'danger');
+            return;
+        }
+
+        renderItemPublishResult(responseData, true);
+        showToast(responseData.message || '商品发布成功', 'success');
+    } catch (error) {
+        console.error('发布商品失败:', error);
+        const errorMessage = error.message || '发布商品失败';
+        renderItemPublishResult({ message: errorMessage, detail: errorMessage }, false);
+        showToast(errorMessage, 'danger');
+    } finally {
+        itemPublishSubmitting = false;
+        if (submitButton) {
+            submitButton.disabled = false;
+            submitButton.innerHTML = '<i class="bi bi-cloud-upload me-1"></i>发布商品';
+        }
     }
 }
 

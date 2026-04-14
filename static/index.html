@@ -83,6 +83,12 @@
           <span>账号管理</span>
         </a>
       </div>
+      <div class="nav-item" data-menu-id="item-publish">
+        <a href="javascript:void(0)" class="nav-link" onclick="showSection('item-publish')">
+          <i class="bi bi-bag-plus"></i>
+          <span>商品发布</span>
+        </a>
+      </div>
       <div class="nav-item" data-menu-id="items">
         <a href="javascript:void(0)" class="nav-link" onclick="showSection('items')">
           <i class="bi bi-box-seam"></i>
@@ -729,6 +735,162 @@
                     <div class="about-placeholder-sub">输入会话 ID 后即可查询并展示最近的历史消息。</div>
                   </div>
                 </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="item-publish-section" class="content-section">
+      <div class="content-header">
+        <h2 class="mb-0">
+          <i class="bi bi-bag-plus me-2"></i>
+          商品发布
+        </h2>
+        <p class="text-muted mb-0">选择账号填写商品信息，发布成功后会自动同步到商品管理列表</p>
+      </div>
+
+      <div class="content-body">
+        <div class="row g-4 item-publish-layout">
+          <div class="col-xl-8">
+            <div class="card item-publish-form-card">
+              <div class="card-header d-flex justify-content-between align-items-center">
+                <div>
+                  <h5 class="mb-1">发布表单</h5>
+                  <div class="text-muted small">第一版支持单商品发布、多图上传、价格与运费配置。</div>
+                </div>
+                <span class="badge text-bg-light border">单商品</span>
+              </div>
+              <div class="card-body">
+                <form id="itemPublishForm" onsubmit="submitItemPublishForm(); return false;">
+                  <div class="row g-3">
+                    <div class="col-md-6">
+                      <label for="publishCookieId" class="form-label">发布账号</label>
+                      <select class="form-select" id="publishCookieId" required>
+                        <option value="">请选择账号</option>
+                      </select>
+                    </div>
+                    <div class="col-md-6">
+                      <label for="publishDeliveryChoice" class="form-label">运费方式</label>
+                      <select class="form-select" id="publishDeliveryChoice" onchange="handlePublishDeliveryChoiceChange()" required>
+                        <option value="包邮">包邮</option>
+                        <option value="按距离计费">按距离计费</option>
+                        <option value="一口价">一口价</option>
+                        <option value="无需邮寄">无需邮寄</option>
+                      </select>
+                    </div>
+
+                    <div class="col-12">
+                      <label for="publishTitle" class="form-label">商品标题</label>
+                      <input type="text" class="form-control" id="publishTitle" maxlength="60" placeholder="输入商品标题" required>
+                    </div>
+
+                    <div class="col-12">
+                      <label for="publishDescription" class="form-label">商品描述</label>
+                      <textarea class="form-control" id="publishDescription" rows="5" maxlength="5000" placeholder="输入商品描述，建议包含成色、规格、发货说明等信息" required></textarea>
+                    </div>
+
+                    <div class="col-md-4">
+                      <label for="publishCurrentPrice" class="form-label">现价</label>
+                      <div class="input-group">
+                        <span class="input-group-text">¥</span>
+                        <input type="number" class="form-control" id="publishCurrentPrice" min="0" step="0.01" placeholder="留空则使用默认价">
+                      </div>
+                    </div>
+
+                    <div class="col-md-4">
+                      <label for="publishOriginalPrice" class="form-label">原价</label>
+                      <div class="input-group">
+                        <span class="input-group-text">¥</span>
+                        <input type="number" class="form-control" id="publishOriginalPrice" min="0" step="0.01" placeholder="可选">
+                      </div>
+                    </div>
+
+                    <div class="col-md-4" id="publishPostPriceWrap" style="display: none;">
+                      <label for="publishPostPrice" class="form-label">邮费</label>
+                      <div class="input-group">
+                        <span class="input-group-text">¥</span>
+                        <input type="number" class="form-control" id="publishPostPrice" min="0" step="0.01" placeholder="请输入邮费">
+                      </div>
+                    </div>
+
+                    <div class="col-12">
+                      <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" id="publishCanSelfPickup">
+                        <label class="form-check-label" for="publishCanSelfPickup">支持买家自提</label>
+                      </div>
+                    </div>
+
+                    <div class="col-12">
+                      <label for="publishImages" class="form-label">商品图片</label>
+                      <input
+                        type="file"
+                        class="form-control"
+                        id="publishImages"
+                        accept="image/*"
+                        multiple
+                        onchange="handlePublishImagesChange()"
+                        required
+                      >
+                      <div class="form-text" id="publishImageSummary">请上传 1-9 张图片，建议首图清晰展示商品主体。</div>
+                    </div>
+
+                    <div class="col-12">
+                      <div id="publishImagePreviewList" class="item-publish-preview-list">
+                        <div class="item-publish-preview-empty">尚未选择图片</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="d-flex flex-wrap gap-2 mt-4">
+                    <button type="submit" class="btn btn-primary" id="itemPublishSubmitBtn">
+                      <i class="bi bi-cloud-upload me-1"></i>发布商品
+                    </button>
+                    <button type="button" class="btn btn-outline-secondary" onclick="document.getElementById('itemPublishForm').reset(); clearItemPublishForm(false);">
+                      <i class="bi bi-arrow-counterclockwise me-1"></i>重置表单
+                    </button>
+                    <button type="button" class="btn btn-outline-dark" onclick="showSection('items')">
+                      <i class="bi bi-box-seam me-1"></i>查看商品管理
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          </div>
+
+          <div class="col-xl-4">
+            <div class="card item-publish-guide-card">
+              <div class="card-header">
+                <h5 class="mb-0">发布说明</h5>
+              </div>
+              <div class="card-body">
+                <div class="item-publish-guide-list">
+                  <div class="item-publish-guide-item">
+                    <span class="item-publish-guide-index">1</span>
+                    <div>优先选择启用中的账号进行发布，发布时会自动读取该账号默认地址。</div>
+                  </div>
+                  <div class="item-publish-guide-item">
+                    <span class="item-publish-guide-index">2</span>
+                    <div>图片会直接上传到闲鱼 CDN，发布成功后系统会自动同步最新商品列表。</div>
+                  </div>
+                  <div class="item-publish-guide-item">
+                    <span class="item-publish-guide-index">3</span>
+                    <div>现价可留空使用默认价格；填写原价时，必须同时填写现价。</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card item-publish-result-card mt-4" id="publishResultPanel" style="display: none;">
+              <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="mb-0">发布结果</h5>
+                <span class="badge" id="publishResultBadge">处理中</span>
+              </div>
+              <div class="card-body">
+                <div class="mb-2 fw-semibold" id="publishResultTitle">等待发布</div>
+                <div class="text-muted small mb-3" id="publishResultMessage">提交后这里会展示发布结果和同步状态。</div>
+                <div id="publishResultMeta" class="item-publish-result-meta"></div>
               </div>
             </div>
           </div>

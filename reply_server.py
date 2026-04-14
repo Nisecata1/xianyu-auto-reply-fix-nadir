@@ -7432,6 +7432,115 @@ class ItemSearchMultipleRequest(BaseModel):
     keyword: str
     total_pages: int = 1
 
+
+def _parse_optional_non_negative_float(value: Any, field_label: str) -> Optional[float]:
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        return None
+
+    try:
+        parsed = float(raw_value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{field_label}必须是数字")
+
+    if parsed < 0:
+        raise HTTPException(status_code=400, detail=f"{field_label}必须大于等于 0")
+
+    return parsed
+
+
+def _parse_form_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    normalized = str(value or "").strip().lower()
+    return normalized in {"1", "true", "yes", "on", "y"}
+
+
+def _persist_cookie_value_for_account(
+    cookie_id: str,
+    current_user: Dict[str, Any],
+    original_cookie_value: str,
+    latest_cookie_value: str,
+):
+    cleaned_latest = str(latest_cookie_value or "").strip()
+    if not cleaned_latest or cleaned_latest == str(original_cookie_value or "").strip():
+        return
+
+    db_manager.update_cookie_account_info(
+        cookie_id,
+        cookie_value=cleaned_latest,
+        user_id=current_user["user_id"],
+    )
+    if cookie_manager.manager is not None:
+        cookie_manager.manager.update_cookie(cookie_id, cleaned_latest, save_to_db=False)
+
+
+async def _sync_items_after_publish(
+    cookie_id: str,
+    cookies_str: str,
+    published_item_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    from XianyuAutoAsync import XianyuLive
+
+    xianyu_instance = XianyuLive(cookies_str, cookie_id, register_instance=False)
+    fallback_result = None
+    page_sync_result = None
+    item_synced = None
+
+    try:
+        page_sync_result = await xianyu_instance.get_item_list_info(
+            page_number=1,
+            page_size=100,
+            sync_item_details=True,
+        )
+
+        if published_item_id:
+            item_synced = bool(db_manager.get_item_info(cookie_id, published_item_id))
+
+        if published_item_id and not item_synced:
+            fallback_result = await xianyu_instance.get_all_items(
+                page_size=100,
+                max_pages=3,
+                sync_item_details=True,
+            )
+            item_synced = bool(db_manager.get_item_info(cookie_id, published_item_id))
+
+        sync_success = bool(page_sync_result and page_sync_result.get("success"))
+        fallback_success = bool(fallback_result and fallback_result.get("success"))
+
+        summary_message = "已同步最新商品列表"
+        if published_item_id:
+            if item_synced:
+                summary_message = f"已同步发布商品 {published_item_id}"
+            else:
+                summary_message = f"已执行同步，但暂未在本地列表确认商品 {published_item_id}"
+        elif not sync_success and not fallback_success:
+            summary_message = "发布成功，但同步最新商品列表失败"
+
+        return {
+            "success": sync_success or fallback_success,
+            "message": summary_message,
+            "published_item_id": published_item_id,
+            "item_synced": item_synced,
+            "page_sync": {
+                "success": bool(page_sync_result and page_sync_result.get("success")),
+                "current_count": int((page_sync_result or {}).get("current_count", 0) or 0),
+                "saved_count": int((page_sync_result or {}).get("saved_count", 0) or 0),
+                "error": (page_sync_result or {}).get("error"),
+            },
+            "full_sync": {
+                "used": fallback_result is not None,
+                "success": bool(fallback_result and fallback_result.get("success")),
+                "total_count": int((fallback_result or {}).get("total_count", 0) or 0),
+                "total_saved": int((fallback_result or {}).get("total_saved", 0) or 0),
+                "error": (fallback_result or {}).get("error"),
+            },
+        }
+    finally:
+        await xianyu_instance.close_session()
+
+
 @app.post("/items/search")
 async def search_items(
     search_request: ItemSearchRequest,
@@ -7578,6 +7687,139 @@ async def search_multiple_pages(
         error_msg = str(e)
         logger.error(f"{user_info} 多页商品搜索失败: {error_msg}")
         raise HTTPException(status_code=500, detail=f"多页商品搜索失败: {error_msg}")
+
+
+@app.post("/item-publish")
+async def publish_item(
+    cookie_id: str = Form(...),
+    title: str = Form(...),
+    description: str = Form(default=""),
+    current_price: str = Form(default=""),
+    original_price: str = Form(default=""),
+    delivery_choice: str = Form(...),
+    post_price: str = Form(default=""),
+    can_self_pickup: str = Form(default="false"),
+    images: List[UploadFile] = File(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """发布单个商品，并在成功后同步到本地商品列表。"""
+    user_prefix = get_user_log_prefix(current_user)
+
+    cleaned_cookie_id = _ensure_cookie_access(cookie_id, current_user)
+    cookies_map = _get_user_cookies_map(current_user)
+    cookies_str = str(cookies_map.get(cleaned_cookie_id) or "").strip()
+    if not cookies_str:
+        raise HTTPException(status_code=400, detail="账号 Cookie 为空，无法发布商品")
+
+    cleaned_title = str(title or "").strip()
+    cleaned_description = str(description or "").strip()
+    if not cleaned_title:
+        raise HTTPException(status_code=400, detail="商品标题不能为空")
+    if not cleaned_description:
+        raise HTTPException(status_code=400, detail="商品描述不能为空")
+
+    if not images:
+        raise HTTPException(status_code=400, detail="请至少上传 1 张商品图片")
+    if len(images) > 9:
+        raise HTTPException(status_code=400, detail="单次最多上传 9 张商品图片")
+
+    current_price_value = _parse_optional_non_negative_float(current_price, "现价")
+    original_price_value = _parse_optional_non_negative_float(original_price, "原价")
+    post_price_value = _parse_optional_non_negative_float(post_price, "邮费")
+    can_self_pickup_value = _parse_form_bool(can_self_pickup)
+
+    if original_price_value is not None and current_price_value is None:
+        raise HTTPException(status_code=400, detail="填写原价时必须同时填写现价")
+    if delivery_choice == "一口价" and post_price_value is None:
+        raise HTTPException(status_code=400, detail="运费方式为一口价时必须填写邮费")
+
+    image_payloads = []
+    for index, image in enumerate(images, start=1):
+        if image.content_type and not image.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail=f"第 {index} 张文件不是图片")
+
+        image_content = await image.read()
+        if not image_content:
+            raise HTTPException(status_code=400, detail=f"第 {index} 张图片为空")
+
+        image_payloads.append(
+            {
+                "filename": image.filename or f"publish-image-{index}.jpg",
+                "content": image_content,
+            }
+        )
+
+    try:
+        from utils.item_publisher import ItemPublisher
+
+        logger.info(
+            f"{user_prefix} 开始发布商品: cookie_id={cleaned_cookie_id}, "
+            f"title={cleaned_title}, images={len(image_payloads)}, delivery_choice={delivery_choice}"
+        )
+
+        async with ItemPublisher(cookies_str, cleaned_cookie_id) as publisher:
+            publish_result = await publisher.publish_item(
+                title=cleaned_title,
+                description=cleaned_description,
+                images=image_payloads,
+                current_price=current_price_value,
+                original_price=original_price_value,
+                delivery_choice=delivery_choice,
+                post_price=post_price_value,
+                can_self_pickup=can_self_pickup_value,
+            )
+            latest_cookies_str = publisher.cookies_str
+            published_item_id = publisher.extract_published_item_id(publish_result)
+
+            if not publisher.is_success_response(publish_result):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"商品发布失败: {publisher.extract_error_message(publish_result)}",
+                )
+
+        _persist_cookie_value_for_account(
+            cleaned_cookie_id,
+            current_user,
+            cookies_str,
+            latest_cookies_str,
+        )
+
+        sync_result = await _sync_items_after_publish(
+            cleaned_cookie_id,
+            latest_cookies_str or cookies_str,
+            published_item_id=published_item_id,
+        )
+
+        sync_success = bool(sync_result.get("success"))
+        success_message = "商品发布成功"
+        if sync_success:
+            success_message = "商品发布成功，已同步到商品管理"
+        elif sync_result.get("message"):
+            success_message = f"商品发布成功，{sync_result['message']}"
+
+        logger.info(
+            f"{user_prefix} 商品发布完成: cookie_id={cleaned_cookie_id}, "
+            f"published_item_id={published_item_id or 'unknown'}, sync_success={sync_success}"
+        )
+
+        return {
+            "success": True,
+            "message": success_message,
+            "published_item_id": published_item_id,
+            "publish_result": publish_result,
+            "sync_result": sync_result,
+        }
+
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        logger.error(f"{user_prefix} 商品发布运行失败: {mask_sensitive_text(exc)}")
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:
+        logger.error(f"{user_prefix} 商品发布异常: {mask_sensitive_text(exc)}")
+        raise HTTPException(status_code=500, detail=f"商品发布异常: {str(exc)}")
 
 
 
