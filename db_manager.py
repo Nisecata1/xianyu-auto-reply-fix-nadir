@@ -325,6 +325,7 @@ class DBManager:
                 auto_confirm INTEGER DEFAULT 1,
                 remark TEXT DEFAULT '',
                 status_note TEXT DEFAULT '',
+                qr_login_grace_until INTEGER DEFAULT 0,
                 pause_duration INTEGER DEFAULT 10,
                 username TEXT DEFAULT '',
                 password TEXT DEFAULT '',
@@ -978,6 +979,11 @@ Cookie数量: {cookie_count}
                 logger.info("添加cookies表的status_note列...")
                 cursor.execute("ALTER TABLE cookies ADD COLUMN status_note TEXT DEFAULT ''")
                 logger.info("数据库迁移完成：添加status_note列")
+
+            if 'qr_login_grace_until' not in cookie_columns:
+                logger.info("添加cookies表的qr_login_grace_until列...")
+                cursor.execute("ALTER TABLE cookies ADD COLUMN qr_login_grace_until INTEGER DEFAULT 0")
+                logger.info("数据库迁移完成：添加qr_login_grace_until列")
 
             # 检查cookies表是否存在pause_duration列
             if 'pause_duration' not in cookie_columns:
@@ -2117,15 +2123,15 @@ Cookie数量: {cookie_count}
                 cursor = self.conn.cursor()
                 self._execute_sql(cursor, """
                     SELECT id, value, user_id, auto_confirm, remark, status_note,
-                           pause_duration, username, password, show_browser, created_at,
+                           qr_login_grace_until, pause_duration, username, password, show_browser, created_at,
                            proxy_type, proxy_host, proxy_port, proxy_user, proxy_pass
                     FROM cookies WHERE id = ?
                 """, (cookie_id,))
                 result = cursor.fetchone()
                 if result:
                     cookie_value = self._decrypt_secret(result[1])
-                    password = self._decrypt_secret(result[8])
-                    proxy_pass = self._decrypt_secret(result[15])
+                    password = self._decrypt_secret(result[9])
+                    proxy_pass = self._decrypt_secret(result[16])
                     return {
                         'id': result[0],
                         'value': cookie_value,
@@ -2133,16 +2139,17 @@ Cookie数量: {cookie_count}
                         'auto_confirm': bool(result[3]),
                         'remark': result[4] or '',
                         'status_note': result[5] or '',
-                        'pause_duration': result[6] if result[6] is not None else 10,  # 0是有效值，表示不暂停
-                        'username': result[7] or '',
+                        'qr_login_grace_until': int(result[6] or 0),
+                        'pause_duration': result[7] if result[7] is not None else 10,  # 0是有效值，表示不暂停
+                        'username': result[8] or '',
                         'password': password,
-                        'show_browser': bool(result[9]) if result[9] is not None else False,
-                        'created_at': result[10],
+                        'show_browser': bool(result[10]) if result[10] is not None else False,
+                        'created_at': result[11],
                         # 代理配置
-                        'proxy_type': result[11] or 'none',
-                        'proxy_host': result[12] or '',
-                        'proxy_port': result[13] or 0,
-                        'proxy_user': result[14] or '',
+                        'proxy_type': result[12] or 'none',
+                        'proxy_host': result[13] or '',
+                        'proxy_port': result[14] or 0,
+                        'proxy_user': result[15] or '',
                         'proxy_pass': proxy_pass
                     }
                 return None
@@ -2187,6 +2194,19 @@ Cookie数量: {cookie_count}
                 return True
             except Exception as e:
                 logger.error(f"更新账号状态文案失败: {e}")
+                return False
+
+    def set_cookie_qr_login_grace_until(self, cookie_id: str, grace_until: int) -> bool:
+        """更新账号扫码登录稳定期截止时间"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "UPDATE cookies SET qr_login_grace_until = ? WHERE id = ?", (int(grace_until or 0), cookie_id))
+                self.conn.commit()
+                logger.info(f"更新账号 {cookie_id} 扫码稳定期截止时间: {int(grace_until or 0)}")
+                return True
+            except Exception as e:
+                logger.error(f"更新账号扫码稳定期失败: {e}")
                 return False
 
     def update_cookie_pause_duration(self, cookie_id: str, pause_duration: int) -> bool:

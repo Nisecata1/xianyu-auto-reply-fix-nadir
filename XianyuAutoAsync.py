@@ -295,13 +295,9 @@ class XianyuLive:
     _init_auth_failure_threshold = 3
     _init_auth_cooldown = 60
 
-    # 扫码登录token预热缓存，避免扫码成功后正式任务立即再次刷新token
-    _qr_prewarmed_tokens = {}  # {cookie_id: {'token': str, 'timestamp': float}}
-    _qr_prewarmed_token_ttl = 180  # 秒
-
     # 扫码登录后的短期缓冲状态：首轮 token 刷新命中风控时，先做浏览器侧稳定化再决定是否上滑块
     _qr_login_grace_state = {}  # {cookie_id: {'timestamp': float, 'captcha_buffer_used': bool, 'browser_stabilized': bool}}
-    _qr_login_grace_ttl = 180  # 秒
+    _qr_login_grace_ttl = max(300, int(RISK_CONTROL.get('qr_login_grace_minutes', 15) or 15) * 60)
 
     @classmethod
     def _cleanup_auth_prewarmed_tokens(cls):
@@ -345,49 +341,6 @@ class XianyuLive:
         if not cookie_id:
             return
         cls._auth_prewarmed_tokens.pop(cookie_id, None)
-
-    @classmethod
-    def _cleanup_qr_prewarmed_tokens(cls):
-        """清理过期的扫码预热token缓存"""
-        now = time.time()
-        expired_cookie_ids = [
-            cookie_id
-            for cookie_id, token_info in cls._qr_prewarmed_tokens.items()
-            if now - token_info.get('timestamp', 0) > cls._qr_prewarmed_token_ttl
-        ]
-        for cookie_id in expired_cookie_ids:
-            cls._qr_prewarmed_tokens.pop(cookie_id, None)
-
-    @classmethod
-    def cache_qr_prewarmed_token(cls, cookie_id: str, token: str):
-        """缓存扫码登录预热好的token，供后续正式实例直接复用"""
-        if not cookie_id or not token:
-            return
-        cls._cleanup_qr_prewarmed_tokens()
-        cls._qr_prewarmed_tokens[cookie_id] = {
-            'token': token,
-            'timestamp': time.time()
-        }
-
-    @classmethod
-    def pop_qr_prewarmed_token(cls, cookie_id: str) -> Optional[Dict[str, Any]]:
-        """弹出扫码登录预热token，过期则忽略"""
-        if not cookie_id:
-            return None
-        cls._cleanup_qr_prewarmed_tokens()
-        token_info = cls._qr_prewarmed_tokens.pop(cookie_id, None)
-        if not token_info:
-            return None
-        if time.time() - token_info.get('timestamp', 0) > cls._qr_prewarmed_token_ttl:
-            return None
-        return token_info
-
-    @classmethod
-    def clear_qr_prewarmed_token(cls, cookie_id: str):
-        """清理指定账号的扫码预热token缓存"""
-        if not cookie_id:
-            return
-        cls._qr_prewarmed_tokens.pop(cookie_id, None)
 
     @classmethod
     def _cleanup_manual_refresh_state(cls):
@@ -593,6 +546,10 @@ class XianyuLive:
         cls._qr_login_grace_state[cookie_id] = state
 
     @classmethod
+    def get_qr_login_grace_ttl_seconds(cls) -> int:
+        return max(300, int(RISK_CONTROL.get('qr_login_grace_minutes', 15) or 15) * 60)
+
+    @classmethod
     def get_qr_login_grace(cls, cookie_id: str) -> Optional[Dict[str, Any]]:
         """获取扫码登录缓冲状态，过期则自动忽略"""
         if not cookie_id:
@@ -622,6 +579,58 @@ class XianyuLive:
         if not cookie_id:
             return
         cls._qr_login_grace_state.pop(cookie_id, None)
+
+    def _get_qr_login_grace_until(self) -> int:
+        try:
+            account_info = db_manager.get_cookie_details(self.cookie_id) or {}
+            return int(account_info.get('qr_login_grace_until') or 0)
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】读取扫码稳定期截止时间失败: {self._safe_str(e)}")
+            return 0
+
+    def _get_qr_login_grace_remaining_seconds(self, current_time: Optional[float] = None) -> int:
+        current_time = current_time or time.time()
+        grace_until = self._get_qr_login_grace_until()
+        return max(0, int(grace_until - current_time))
+
+    def _is_in_qr_login_grace_period(self, current_time: Optional[float] = None) -> bool:
+        return self._get_qr_login_grace_remaining_seconds(current_time) > 0
+
+    def _set_qr_login_grace_until(self, grace_until: int) -> None:
+        db_manager.set_cookie_qr_login_grace_until(self.cookie_id, int(grace_until or 0))
+
+    def _clear_qr_login_grace_period(self) -> None:
+        self.clear_qr_login_grace(self.cookie_id)
+        self._set_qr_login_grace_until(0)
+
+    def _enter_qr_login_grace_period(self, *, stage: str = 'qr_login_success') -> int:
+        now = time.time()
+        grace_until = int(now + self.get_qr_login_grace_ttl_seconds())
+        self.mark_qr_login_grace(self.cookie_id, stage=stage, entered_at=now)
+        self._set_qr_login_grace_until(grace_until)
+        return grace_until
+
+    def _consume_qr_login_grace_period_if_expired(self, current_time: Optional[float] = None) -> bool:
+        current_time = current_time or time.time()
+        grace_until = self._get_qr_login_grace_until()
+        if not grace_until:
+            return False
+        if current_time < grace_until:
+            return False
+        self._clear_qr_login_grace_period()
+        logger.info(f"【{self.cookie_id}】扫码登录稳定期已结束，恢复自动认证链路")
+        return True
+
+    def _should_defer_auth_recovery_for_qr_grace(self, current_time: Optional[float] = None) -> bool:
+        current_time = current_time or time.time()
+        self._consume_qr_login_grace_period_if_expired(current_time)
+        remaining = self._get_qr_login_grace_remaining_seconds(current_time)
+        if remaining <= 0:
+            return False
+        self.last_token_refresh_status = "qr_login_grace_wait"
+        self.last_token_refresh_error_message = f"扫码登录稳定期中，剩余{remaining}秒"
+        logger.warning(f"【{self.cookie_id}】扫码登录稳定期中，暂缓自动认证恢复，还需等待 {remaining} 秒")
+        return True
 
     @classmethod
     def _cleanup_password_login_failure_backoff(cls):
@@ -919,6 +928,7 @@ class XianyuLive:
 
     async def _clear_account_pause_state(self, reason: str = "认证恢复成功") -> None:
         self.last_token_refresh_error_message = ""
+        self._clear_qr_login_grace_period()
 
         try:
             db_manager.update_cookie_status_note(self.cookie_id, '')
@@ -1702,6 +1712,16 @@ class XianyuLive:
 
     def _calculate_retry_delay(self, error_msg: str) -> int:
         """根据错误类型和失败次数计算重试延迟"""
+        current_time = time.time()
+        if self._is_account_pause_status(getattr(self, 'last_token_refresh_status', None)):
+            return max(300, self._compute_token_retry_wait_seconds(current_time))
+
+        if self._is_in_qr_login_grace_period(current_time):
+            return max(60, self._get_qr_login_grace_remaining_seconds(current_time))
+
+        if getattr(self, 'last_token_refresh_status', None) in {"password_login_backoff_wait", "verification_pending_manual", "qr_login_grace_wait"}:
+            return max(60, self._compute_token_retry_wait_seconds(current_time))
+
         # WebSocket意外断开 - 短延迟
         if "no close frame received or sent" in error_msg:
             return min(3 * self.connection_failures, 15)
@@ -1948,12 +1968,6 @@ class XianyuLive:
             logger.info(
                 f"【{cookie_id}】已复用认证预热token，来源: {prewarmed_token_info.get('source') or 'unknown'}"
             )
-
-        prewarmed_token_info = self.pop_qr_prewarmed_token(self.cookie_id)
-        if prewarmed_token_info and not self.current_token:
-            self.current_token = prewarmed_token_info.get('token')
-            self.last_token_refresh_time = prewarmed_token_info.get('timestamp', time.time())
-            logger.info(f"【{cookie_id}】已复用扫码预热token，跳过首次token刷新")
 
         # 通知防重复机制
         self.last_notification_time = {}  # 记录每种通知类型的最后发送时间
@@ -6166,7 +6180,7 @@ class XianyuLive:
                                 # 【消息接收时间重置】Token刷新成功后重置消息接收标志，与 cookie_refresh_loop 保持一致
                                 self.last_message_received_time = 0
                                 logger.warning(f"【{self.cookie_id}】Token刷新成功，已重置消息接收时间标识")
-                                self.clear_qr_login_grace(self.cookie_id)
+                                self._clear_qr_login_grace_period()
                                 self.clear_init_auth_failure_state(self.cookie_id)
                                 self.last_init_failure_reason = None
                                 self.last_init_failure_type = None
@@ -7104,6 +7118,36 @@ class XianyuLive:
                     result_code='manual_refresh_active',
                     processing_status='failed',
                     error_message='手动刷新进行中，自动密码登录刷新已跳过',
+                    duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                    event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
+                )
+            return False
+
+        if self._is_account_pause_status(getattr(self, 'last_token_refresh_status', None)):
+            logger.warning(f"【{self.cookie_id}】账号处于人工验证/风控暂停状态，跳过自动密码登录刷新")
+            if refresh_risk_log_id:
+                self._update_risk_log(
+                    refresh_risk_log_id,
+                    session_id=risk_session_id,
+                    trigger_scene=trigger_scene,
+                    result_code='account_pause_active',
+                    processing_status='failed',
+                    error_message='账号处于人工验证/风控暂停状态，自动密码登录刷新已跳过',
+                    duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                    event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
+                )
+            return False
+
+        if self._should_defer_auth_recovery_for_qr_grace():
+            logger.warning(f"【{self.cookie_id}】扫码登录稳定期内，跳过自动密码登录刷新")
+            if refresh_risk_log_id:
+                self._update_risk_log(
+                    refresh_risk_log_id,
+                    session_id=risk_session_id,
+                    trigger_scene=trigger_scene,
+                    result_code='qr_login_grace_active',
+                    processing_status='failed',
+                    error_message=self.last_token_refresh_error_message or '扫码登录稳定期内，自动密码登录刷新已跳过',
                     duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
                     event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
                 )
@@ -11547,6 +11591,15 @@ class XianyuLive:
                         break
 
                     current_time = time.time()
+                    if self._is_account_pause_status(getattr(self, 'last_token_refresh_status', None)):
+                        logger.warning(f"【{self.cookie_id}】账号处于人工验证/风控暂停状态，暂停会话保活循环")
+                        await self._interruptible_sleep(300)
+                        continue
+
+                    if self._should_defer_auth_recovery_for_qr_grace(current_time):
+                        await self._interruptible_sleep(max(60, self._get_qr_login_grace_remaining_seconds(current_time)))
+                        continue
+
                     effective_keepalive_interval = self._get_effective_keepalive_interval()
                     if current_time - self.last_session_keepalive_time >= effective_keepalive_interval:
                         logger.info(f"【{self.cookie_id}】开始执行轻量会话保活...")
@@ -12187,6 +12240,15 @@ class XianyuLive:
                         continue
 
                     current_time = time.time()
+                    if self._is_account_pause_status(getattr(self, 'last_token_refresh_status', None)):
+                        logger.warning(f"【{self.cookie_id}】账号处于人工验证/风控暂停状态，跳过自动Cookie刷新")
+                        await self._interruptible_sleep(300)
+                        continue
+
+                    if self._should_defer_auth_recovery_for_qr_grace(current_time):
+                        await self._interruptible_sleep(max(60, self._get_qr_login_grace_remaining_seconds(current_time)))
+                        continue
+
                     if self._should_skip_token_refresh_for_login_backoff(current_time):
                         logger.info(f"【{self.cookie_id}】当前处于密码登录退避期，跳过自动Cookie刷新")
                         await self._interruptible_sleep(60)

@@ -23,6 +23,7 @@ from collections import defaultdict
 
 import cookie_manager
 from db_manager import db_manager
+from config import RISK_CONTROL
 from file_log_collector import setup_file_logging, get_file_log_collector
 from ai_reply_engine import ai_reply_engine
 from utils.qr_login import qr_login_manager
@@ -5336,30 +5337,12 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     real_cookies = updated_cookie_info['cookies_str']
                     log_with_user('info', f"已获取真实cookie，长度: {len(real_cookies)}", current_user)
 
-                    XianyuLive.mark_qr_login_grace(account_id, stage='real_cookie_ready')
-
-                    token_prewarmed = False
+                    qr_login_grace_minutes = max(5, int(RISK_CONTROL.get('qr_login_grace_minutes', 15) or 15))
+                    qr_login_grace_until = int(time.time() + (qr_login_grace_minutes * 60))
                     task_restarted = False
                     warning_message = None
                     final_cookies = temp_instance.cookies_str or real_cookies
-
-                    try:
-                        log_with_user('info', f"开始预热扫码登录Token: {account_id}", current_user)
-                        prewarmed_token = await temp_instance.refresh_token()
-                        final_cookies = temp_instance.cookies_str or real_cookies
-
-                        if prewarmed_token:
-                            XianyuLive.cache_qr_prewarmed_token(account_id, prewarmed_token)
-                            token_prewarmed = True
-                            XianyuLive.clear_qr_login_grace(account_id)
-                            log_with_user('info', f"扫码登录Token预热成功: {account_id}", current_user)
-                        else:
-                            warning_message = "真实Cookie已获取，但首次Token初始化未完成，将在账号任务启动后继续重试"
-                            log_with_user('warning', f"{warning_message}: {account_id}", current_user)
-                    except Exception as token_e:
-                        final_cookies = temp_instance.cookies_str or real_cookies
-                        warning_message = f"真实Cookie已获取，但首次Token初始化异常，将在账号任务启动后继续重试: {str(token_e)}"
-                        log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+                    log_with_user('warning', f"{warning_message}: {account_id}", current_user)
 
                     try:
                         if cookie_manager.manager:
@@ -5371,22 +5354,21 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                                 cookie_manager.manager.update_cookie(account_id, final_cookies, save_to_db=False)
                                 log_with_user('info', f"已更新cookie_manager中的真实cookie: {account_id}", current_user)
                             task_restarted = True
-                            if not token_prewarmed:
-                                warning_message = warning_message or "真实Cookie已获取，账号任务已切换；首次Token将在后台继续初始化"
-                                log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+                            db_manager.set_cookie_qr_login_grace_until(account_id, qr_login_grace_until)
+                            XianyuLive.mark_qr_login_grace(account_id, stage='real_cookie_ready', grace_until=qr_login_grace_until)
+                            warning_message = f"真实Cookie已获取，账号任务已切换；为降低再次触发风控的概率，将进入 {qr_login_grace_minutes} 分钟稳定期，稳定期内不自动预热Token"
+                            log_with_user('warning', f"{warning_message}: {account_id}", current_user)
                         else:
                             warning_message = "真实Cookie已获取，但任务管理器未初始化，未启动账号任务"
                             log_with_user('warning', f"{warning_message}: {account_id}", current_user)
                     except Exception as task_switch_e:
-                        if token_prewarmed:
-                            XianyuLive.clear_qr_prewarmed_token(account_id)
+                        db_manager.set_cookie_qr_login_grace_until(account_id, 0)
                         XianyuLive.clear_qr_login_grace(account_id)
                         warning_message = f"真实Cookie已获取，但切换账号任务失败: {str(task_switch_e)}"
                         log_with_user('warning', f"{warning_message}: {account_id}", current_user)
 
                     if not task_restarted:
-                        if token_prewarmed:
-                            XianyuLive.clear_qr_prewarmed_token(account_id)
+                        db_manager.set_cookie_qr_login_grace_until(account_id, 0)
                         XianyuLive.clear_qr_login_grace(account_id)
                         if not warning_message:
                             warning_message = "真实Cookie已获取，但任务管理器未初始化，未启动账号任务"
@@ -5405,10 +5387,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                         try:
                             if task_restarted:
                                 processing_result = '扫码登录真实Cookie获取成功，账号任务已启动'
-                                if token_prewarmed:
-                                    processing_result += '，Token预热完成'
-                                else:
-                                    processing_result += '；Token预热未完成，将在首次刷新时继续重试'
+                                processing_result += f'；已进入 {qr_login_grace_minutes} 分钟稳定期，稳定期内不自动预热Token'
                                 db_manager.update_risk_control_log(
                                     log_id=risk_log_id,
                                     processing_status='success',
@@ -5421,7 +5400,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                                         'account_id': account_id,
                                         'is_new_account': is_new_account,
                                         'task_restarted': task_restarted,
-                                        'token_prewarmed': token_prewarmed,
+                                        'token_prewarmed': False,
                                     })
                                 )
                             else:
@@ -5438,7 +5417,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                                         'account_id': account_id,
                                         'is_new_account': is_new_account,
                                         'task_restarted': task_restarted,
-                                        'token_prewarmed': token_prewarmed,
+                                        'token_prewarmed': False,
                                     })
                                 )
                         except Exception:
@@ -5449,7 +5428,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                         'is_new_account': is_new_account,
                         'real_cookie_refreshed': task_restarted,  # 回滚时为 False，成功切换时为 True
                         'cookie_length': len(final_cookies),
-                        'token_prewarmed': token_prewarmed,
+                        'token_prewarmed': False,
                         'task_restarted': task_restarted,
                         'warning_message': warning_message
                     }
