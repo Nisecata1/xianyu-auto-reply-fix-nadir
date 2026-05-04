@@ -138,7 +138,10 @@ def build_cookie_verification_sign(ts: str, token: str, data: str) -> str:
     return hashlib.md5(f"{token}&{ts}&34839810&{data}".encode("utf-8")).hexdigest()
 
 
-def resolve_verification_url_from_cookie(cookie_text: str, proxy: Optional[Dict[str, Any]] = None) -> str:
+def probe_cookie_verification_from_cookie(
+    cookie_text: str,
+    proxy: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     import requests
 
     cookies = parse_cookie_string(cookie_text)
@@ -215,10 +218,45 @@ def resolve_verification_url_from_cookie(cookie_text: str, proxy: Optional[Dict[
     )
     response.raise_for_status()
     payload = response.json()
-    verification_url = (payload.get("data") or {}).get("url", "")
-    if not verification_url:
-        raise RuntimeError(f"未拿到最新 verification_url: {payload}")
-    return verification_url
+    data_payload = payload.get("data") or {}
+    verification_url = str(data_payload.get("url") or "").strip() or None
+    ret_value = payload.get("ret") or []
+    success_ret = any("SUCCESS::调用成功" in str(ret) for ret in ret_value)
+    has_token_payload = any(
+        str(data_payload.get(field) or "").strip()
+        for field in ("accessToken", "refreshToken")
+    )
+
+    status = "unknown"
+    if verification_url:
+        status = "verification_required"
+    elif success_ret and has_token_payload:
+        status = "cookie_valid"
+
+    session_cookies = {}
+    try:
+        session_cookies = dict(session.cookies.get_dict())
+    except Exception:
+        session_cookies = dict(cookies)
+
+    return {
+        "status": status,
+        "verification_url": verification_url,
+        "payload": payload,
+        "session_cookies": session_cookies,
+        "success_ret": success_ret,
+        "has_token_payload": has_token_payload,
+    }
+
+
+def resolve_verification_url_from_cookie(cookie_text: str, proxy: Optional[Dict[str, Any]] = None) -> str:
+    probe_result = probe_cookie_verification_from_cookie(cookie_text, proxy=proxy)
+    verification_url = probe_result.get("verification_url")
+    if verification_url:
+        return verification_url
+    if probe_result.get("status") == "cookie_valid":
+        raise RuntimeError(f"Cookie 已直接有效，无需 verification_url: {probe_result.get('payload')}")
+    raise RuntimeError(f"未拿到最新 verification_url: {probe_result.get('payload')}")
 
 
 class PasswordLoginVerificationError(Exception):
@@ -11196,6 +11234,18 @@ class XianyuSliderStealth:
                         f"{'无头' if self.headless else '有头'}环境指纹已被风控拦截，当前页面不存在可操作滑块"
                     )
                     self._save_debug_snapshot("hard_block_page", self.page)
+                    monitor_page = self._select_monitor_page(self.context, self.page) or self.page
+                    has_qr, qr_frame = self._detect_qr_code_verification(monitor_page)
+                    if has_qr:
+                        verification_result = self._process_verification_requirement(
+                            self.context,
+                            monitor_page,
+                            qr_frame,
+                            notification_callback=notification_callback,
+                            notification_scene=notification_scene,
+                        )
+                        if verification_result:
+                            return True, verification_result
                     return False, None
 
                 self._simulate_human_page_behavior()
@@ -11241,6 +11291,19 @@ class XianyuSliderStealth:
                         logger.warning(f"【{self.pure_user_id}】获取cookie时出错: {str(e)}")
                 else:
                     logger.warning(f"【{self.pure_user_id}】滑块验证失败")
+                    monitor_page = self._select_monitor_page(self.context, self.page) or self.page
+                    has_qr, qr_frame = self._detect_qr_code_verification(monitor_page)
+                    if has_qr:
+                        logger.warning(f"【{self.pure_user_id}】滑块流程结束后检测到身份验证页，转入验证等待流程")
+                        verification_result = self._process_verification_requirement(
+                            self.context,
+                            monitor_page,
+                            qr_frame,
+                            notification_callback=notification_callback,
+                            notification_scene=notification_scene,
+                        )
+                        if verification_result:
+                            return True, verification_result
                     self._save_debug_snapshot("run_failed", getattr(self, "_detected_slider_frame", None))
                 
                 return success, cookies
